@@ -1,4 +1,3 @@
-# agents/manager_agent.py
 import os
 import json
 import time
@@ -136,10 +135,8 @@ class ManagerAgent:
             step += 1
             print(f"\n🔹 ШАГ {step}")
 
-            # === 1. Получаем состояние страницы ===
             current_url, page_summary = self._get_page_state()
             
-            # === 2. Планируем шаг ===
             plan = self._ask_manager(goal, current_url, page_summary, history)
             if not plan or plan.get("is_done"):
                 self._handle_completion(plan)
@@ -150,7 +147,6 @@ class ManagerAgent:
                 print("❌ Менеджер не предложил ни одного действия. Остановка.")
                 break
 
-            # === 3. Выполняем действие ===
             result, should_continue = self._execute_step(
                 executor, options, goal, current_url, page_summary, history
             )
