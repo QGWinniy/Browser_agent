@@ -1,7 +1,6 @@
 # mcp_server.py
-from fastapi import FastAPI, BackgroundTasks
-from playwright.sync_api import sync_playwright, Playwright
-import asyncio
+from fastapi import FastAPI
+from playwright.sync_api import sync_playwright
 import queue
 import threading
 import time
@@ -10,25 +9,23 @@ from typing import Optional
 
 app = FastAPI()
 
-# Глобальные переменные для управления браузером
 browser_thread: Optional[threading.Thread] = None
 playwright_instance = None
 browser = None
 page = None
 
-# Очередь для коммуникации между потоками
 command_queue = queue.Queue()
 result_queue = queue.Queue()
 
 def browser_worker():
-    """Функция, которая запускается в отдельном потоке и управляет браузером"""
+    """Запускается в отдельном потоке. Управляет браузером."""
     global playwright_instance, browser, page
     
     try:
         playwright_instance = sync_playwright().start()
         user_profile = "/home/q/.mozilla/firefox/nsaalvuw.default-release"
         
-        print("Запуск Firefox...")
+        print("🚀 Запуск Firefox...")
         browser = playwright_instance.firefox.launch_persistent_context(
             user_data_dir=user_profile,
             headless=False,
@@ -36,170 +33,227 @@ def browser_worker():
         )
         
         page = browser.pages[0] if browser.pages else browser.new_page()
-        print(f"Браузер запущен. Текущая страница: {page.url}")
+        print(f"✅ Браузер запущен. Стартовая страница: {page.url}")
         
-        # Основной цикл обработки команд
         while True:
             try:
-                # Ждем команду с таймаутом, чтобы можно было проверять флаги
-                command = command_queue.get(timeout=0.1)
+                command = command_queue.get(timeout=0.5)
                 tool = command.get("tool")
                 args = command.get("args", {})
                 
                 try:
                     if tool == "navigate":
                         url = args["url"].strip()
-                        print(f"Переход на: {url}")
-                        page.goto(url)
+                        if not url.startswith(("http://", "https://")):
+                            result_queue.put({"error": "URL должен начинаться с http:// или https://"})
+                            continue
+                        print(f"🌐 Переход на: {url}")
+                        page.goto(url, timeout=300_000)
                         result_queue.put({"result": f"Перешли на {url}"})
-                        
+
+                    elif tool == "wait_for_page_ready":
+                        print("⏳ Ожидание загрузки страницы (до 300 сек)...")
+                        try:
+                            page.wait_for_load_state("networkidle", timeout=300_000)
+                            selectors = (
+                                "button, "
+                                "a[href], "
+                                "[role='button'], "
+                                "input:not([type='hidden']):not([type='button']):not([type='submit']), "
+                                "textarea, "
+                                "[aria-label], "
+                                "div[contenteditable='true'], "
+                                "div[contenteditable=''], "
+                                "div[class*='plus' i], "
+                                "span[class*='plus' i], "
+                                "div[class*='add' i], "
+                                "span[class*='add' i], "
+                                "div[class*='button' i], "
+                                "span[class*='button' i], "
+                                "div[data-testid*='button' i], "
+                                "div[data-testid*='plus' i], "
+                                "div[data-tid*='plus' i], "
+                                "div[data-auto*='plus' i]"
+                            )
+                            page.wait_for_selector(selectors, state="visible", timeout=150_000)
+                            result_queue.put({"result": "Страница готова"})
+                        except Exception as e:
+                            result_queue.put({"result": f"Частичная загрузка: {str(e)[:100]}"})
+
                     elif tool == "get_url":
                         current_url = page.url
-                        print(f"Текущий URL: {current_url}")
+                        print(f"🔗 Текущий URL: {current_url}")
                         result_queue.put({"result": current_url})
-                        
+
                     elif tool == "getElements":
+                        selectors = (
+                            "button, a[href], [role='button'], "
+                            "input:not([type='hidden']):not([type='button']):not([type='submit']), "
+                            "textarea, [aria-label], div[contenteditable='true'], div[contenteditable='']"
+                        )
+                        handles = page.query_selector_all(selectors)
+                        
                         elements = []
-                        handles = page.query_selector_all("button, a, input:not([type='hidden']), [role='button']")
+                        for el in handles:
+                            if not (el.is_visible() and el.is_enabled()):
+                                continue
+                                
+                            tag = el.evaluate("el => el.tagName.toLowerCase()")
+                            text = (el.text_content() or '').strip()
+                            placeholder = el.get_attribute("placeholder") or ""
+                            aria_label = el.get_attribute("aria-label") or ""
+                            title = el.get_attribute("title") or ""
+                            
+                            label = aria_label or text or placeholder or title or f"<{tag}>"
+                            label = label.replace("\n", " ").strip()[:80]
+                            
+                            is_input_tag = tag in ("input", "textarea")
+                            contenteditable = el.get_attribute("contenteditable")
+                            is_contenteditable = contenteditable is not None and contenteditable.strip().lower() in ("", "true")
+                            elem_type = "input" if is_input_tag or is_contenteditable else "clickable"
+                            
+                            elements.append({
+                                "tag": tag,
+                                "text": label,
+                                "type": elem_type
+                            })
                         
-                        for i, el in enumerate(handles):
-                            if el.is_visible():
-                                text = (el.text_content() or '').strip()[:50]
-                                # Удаляем старый атрибут, если есть
-                                el.evaluate("el => el.removeAttribute('data-mcp-id')")
-                                # Устанавливаем новый
-                                el.evaluate(f"el => el.setAttribute('data-mcp-id', '{i}')")
-                                elements.append({
-                                    "id": i,
-                                    "text": text,
-                                    "selector": f"[data-mcp-id='{i}']"
-                                })
-                        
-                        print(f"Найдено элементов: {len(elements)}")
+                        print(f"🔍 Найдено элементов: {len(elements)}")
                         result_queue.put({"result": elements})
-                        
+
                     elif tool == "click":
-                        selector = args["query"]
-                        print(f"Клик по: {selector}")
-                        page.click(selector)
+                        raw_index = args.get("index")
+                        try:
+                            index = int(raw_index)
+                            if index < 0:
+                                raise ValueError("index < 0")
+                        except (ValueError, TypeError):
+                            result_queue.put({"error": f"Неверный index: {repr(raw_index)}"})
+                            continue
+
+                        selectors = (
+                            "button, a[href], [role='button'], "
+                            "input:not([type='hidden']):not([type='button']):not([type='submit']), "
+                            "textarea, [aria-label], div[contenteditable='true'], div[contenteditable='']"
+                        )
+                        all_elements = page.query_selector_all(selectors)
+                        visible_elements = [el for el in all_elements if el.is_visible() and el.is_enabled()]
+                        
+                        if index >= len(visible_elements):
+                            result_queue.put({"error": f"Индекс {index} вне диапазона. Доступно: {len(visible_elements)}"})
+                            continue
+                        
+                        target = visible_elements[index]
+                        tag = target.evaluate("el => el.tagName.toLowerCase()")
+                        is_input = tag in ("input", "textarea") or target.get_attribute("contenteditable") in ("", "true")
+                        
+                        if is_input:
+                            result_queue.put({"error": f"Нельзя кликнуть по полю ввода #{index}"})
+                            continue
+                        
+                        print(f"🖱️ Клик по элементу #{index}")
+                        target.click(timeout=30_000)
                         result_queue.put({"result": "Клик выполнен"})
-                        
+
                     elif tool == "type":
-                        selector = args["query"]
-                        text = args["text"]
-                        print(f"Ввод '{text}' в {selector}")
-                        page.fill(selector, text)
+                        raw_index = args.get("index")
+                        text = args.get("text", "")
+                        try:
+                            index = int(raw_index)
+                            if index < 0:
+                                raise ValueError("index < 0")
+                        except (ValueError, TypeError):
+                            result_queue.put({"error": f"Неверный index: {repr(raw_index)}"})
+                            continue
+
+                        selectors = (
+                            "button, a[href], [role='button'], "
+                            "input:not([type='hidden']):not([type='button']):not([type='submit']), "
+                            "textarea, [aria-label], div[contenteditable='true'], div[contenteditable='']"
+                        )
+                        all_elements = page.query_selector_all(selectors)
+                        visible_elements = [el for el in all_elements if el.is_visible() and el.is_enabled()]
+                        
+                        if index >= len(visible_elements):
+                            result_queue.put({"error": f"Индекс {index} вне диапазона. Доступно: {len(visible_elements)}"})
+                            continue
+                        
+                        target = visible_elements[index]
+                        tag = target.evaluate("el => el.tagName.toLowerCase()")
+                        is_input = tag in ("input", "textarea") or target.get_attribute("contenteditable") in ("", "true")
+                        
+                        if not is_input:
+                            result_queue.put({"error": f"Элемент #{index} не является полем ввода"})
+                            continue
+                        
+                        print(f"⌨️ Ввод в элемент #{index}: '{text}'")
+                        if target.get_attribute("contenteditable") in ("", "true"):
+                            target.click()
+                            page.keyboard.press("Control+A")
+                            page.keyboard.press("Delete")
+                            page.keyboard.type(text, delay=50)
+                        else:
+                            target.fill("")
+                            target.type(text, delay=50)
+                        
                         result_queue.put({"result": f"Введено: {text}"})
-                        
-                    elif tool == "screenshot":
-                        screenshot = page.screenshot()
-                        result_queue.put({"result": screenshot})
-                        
-                    elif tool == "get_html":
-                        html = page.content()
-                        result_queue.put({"result": html})
-                        
+
                     elif tool == "quit":
-                        print("Завершение работы браузера...")
-                        result_queue.put({"result": "Браузер завершен"})
+                        print("🛑 Завершение браузера...")
+                        result_queue.put({"result": "Браузер завершён"})
                         break
-                        
+
                     else:
                         result_queue.put({"error": f"Неизвестный инструмент: {tool}"})
-                        
+
                 except Exception as e:
-                    result_queue.put({"error": str(e)})
-                    
+                    result_queue.put({"error": f"{type(e).__name__}: {str(e)}"})
+
             except queue.Empty:
-                # Если нет команд, продолжаем цикл
                 continue
-            except KeyboardInterrupt:
-                break
-                
+
     except Exception as e:
-        print(f"Ошибка в browser_worker: {e}")
-        result_queue.put({"error": str(e)})
+        print(f"❌ Ошибка в browser_worker: {e}")
+        result_queue.put({"error": f"Запуск браузера сломался: {e}"})
     finally:
-        if browser:
-            try:
+        try:
+            if browser:
                 browser.close()
-            except:
-                pass
-        if playwright_instance:
-            try:
+            if playwright_instance:
                 playwright_instance.stop()
-            except:
-                pass
+        except:
+            pass
 
 def execute_in_browser(tool: str, args: dict = None):
-    """Отправляет команду в браузерный поток и ждет результат"""
+    """Отправляет команду и ждёт результат (до 300 сек)."""
     if args is None:
         args = {}
-    
-    # Отправляем команду
     command_queue.put({"tool": tool, "args": args})
-    
-    # Ждем результат с таймаутом
     try:
-        result = result_queue.get(timeout=10)
-        return result
+        return result_queue.get(timeout=300)
     except queue.Empty:
-        return {"error": "Таймаут ожидания ответа от браузера"}
+        return {"error": "Таймаут 300 сек"}
 
-@app.on_event("startup")
-async def startup_event():
-    """Запускаем браузер при старте сервера"""
-    global browser_thread
-    
-    print("Запуск браузера...")
+@app.post("/mcp")
+def handle_mcp(request: dict):
+    """Обрабатывает MCP-запрос. Возвращает ТОЛЬКО то, что вернул браузер."""
+    tool = request.get("tool")
+    args = request.get("args", {})
+    print(f"📥 MCP: {tool} {args}")
+    return execute_in_browser(tool, args)
+
+
+if __name__ == "__main__":
+    print("🖥️  Запуск MCP-сервера...")
     browser_thread = threading.Thread(target=browser_worker, daemon=True)
     browser_thread.start()
     
-    # Ждем инициализации браузера
-    max_wait = 30
-    for _ in range(max_wait * 2):  # Проверяем каждые 0.5 секунды
-        try:
-            # Проверяем, доступна ли страница
-            if page is not None:
-                print("Браузер успешно запущен!")
-                return
-        except:
-            pass
-        await asyncio.sleep(0.5)
+    for _ in range(60)
+        if page is not None:
+            break
+        time.sleep(0.5)
+    else:
+        print("⚠️  Браузер не запустился за 30 сек")
     
-    print("Предупреждение: Браузер не запустился за отведенное время")
-
-@app.post("/mcp")
-async def mcp_call(request: dict):
-    """Основной обработчик MCP запросов"""
-    tool = request.get("tool")
-    args = request.get("args", {})
-    
-    print(f"Получен запрос: {tool} с аргументами: {args}")
-    
-    # Выполняем команду в браузерном потоке
-    result = execute_in_browser(tool, args)
-    
-    # Добавляем информацию о текущем URL для контекста
-    if "error" not in result:
-        try:
-            url_result = execute_in_browser("get_url", {})
-            if "result" in url_result:
-                result["current_url"] = url_result["result"]
-        except:
-            pass
-    
-    return result
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    """Корректно завершаем работу при остановке сервера"""
-    print("Остановка браузера...")
-    execute_in_browser("quit", {})
-    if browser_thread:
-        browser_thread.join(timeout=5)
-
-if __name__ == "__main__":
-    print("MCP-сервер запущен на http://127.0.0.1:8000")
-    print("Используйте /mcp для доступа к браузеру")
-    uvicorn.run(app, host="127.0.0.1", port=8000, log_level="info")
+    print("✅ MCP-сервер готов на http://127.0.0.1:8000")
+    uvicorn.run(app, host="127.0.0.1", port=8000, log_level="warning")
